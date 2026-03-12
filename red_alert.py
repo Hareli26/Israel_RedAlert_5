@@ -2316,6 +2316,11 @@ class TelegramDialog(QDialog):
             "border-radius:6px;padding:9px 20px;font-size:12px;}"
             "QPushButton:hover{background:#007700;}")
         setup_btn.clicked.connect(self._auto_setup_bot); v.addWidget(setup_btn)
+        self._setup_lbl = QLabel("")
+        self._setup_lbl.setAlignment(Qt.AlignCenter)
+        self._setup_lbl.setFont(QFont("Arial", 11, QFont.Bold))
+        self._setup_lbl.setWordWrap(True)
+        v.addWidget(self._setup_lbl)
         v.addStretch(); v.addWidget(sep())
         bts = QHBoxLayout()
         cas = "QPushButton{background:#333;color:white;border:none;border-radius:6px;padding:9px 20px;}"
@@ -2370,59 +2375,94 @@ class TelegramDialog(QDialog):
 
     def _auto_setup_bot(self):
         """מגדיר שם, תיאור ופקודות של הבוט אוטומטית דרך ה-API."""
+        from PyQt5.QtWidgets import QMessageBox
         token = self._token.text().strip()
         if not token:
-            self._status.setText("❌  הכנס Bot Token קודם")
-            self._status.setStyleSheet("color:#FF6666;font-size:11px;"); return
-        self._status.setText("⏳  מגדיר בוט...")
-        self._status.setStyleSheet("color:#FFCC44;font-size:11px;")
+            self._setup_lbl.setText("❌  יש להכניס Bot Token לפני ההגדרה")
+            self._setup_lbl.setStyleSheet("color:#FF6666;")
+            QMessageBox.warning(self, "חסר Token",
+                                "יש להכניס את ה-Bot Token לפני ההגדרה האוטומטית.")
+            return
+
+        self._setup_lbl.setText("⏳  מתחבר לטלגרם ומגדיר בוט...")
+        self._setup_lbl.setStyleSheet("color:#FFCC44;")
         QApplication.processEvents()
+
+        errors = []
         try:
-            import urllib.request, urllib.parse
+            import urllib.request
             base = f"https://api.telegram.org/bot{token}"
 
             def api(method, payload):
-                data = json.dumps(payload).encode()
+                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 req  = urllib.request.Request(
                     f"{base}/{method}", data=data,
-                    headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=8) as r:
-                    return json.loads(r.read())
+                    headers={"Content-Type": "application/json; charset=utf-8"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    res = json.loads(r.read())
+                if not res.get("ok"):
+                    raise ValueError(res.get("description", "שגיאה לא ידועה"))
+                return res
 
-            # ── שם הבוט ────────────────────────────────────────
-            api("setMyName", {"name": "🔴 Red Alert Monitor"})
+            # ── שם הבוט ────────────────────────────────────
+            try:
+                api("setMyName", {"name": "Red Alert Monitor"})
+            except Exception as e:
+                errors.append(f"שם: {e}")
 
-            # ── תיאור קצר (מוצג לפני /start) ───────────────────
-            api("setMyDescription", {
-                "description": (
-                    "🔴 בוט התרעות צבע אדום בזמן אמת\n"
-                    "מבוסס על נתוני פיקוד העורף — Red Alert Monitor v5\n"
-                    "נבנה על ידי הראלי דודאי"
-                )
-            })
+            # ── תיאור קצר ──────────────────────────────────
+            try:
+                api("setMyShortDescription",
+                    {"short_description": "התרעות צבע אדום בזמן אמת"})
+            except Exception as e:
+                errors.append(f"תיאור קצר: {e}")
 
-            # ── תיאור ארוך (מוצג ב-About הבוט) ─────────────────
-            api("setMyShortDescription", {
-                "short_description": "התרעות צבע אדום בזמן אמת 🔴"
-            })
+            # ── תיאור מלא ──────────────────────────────────
+            try:
+                api("setMyDescription", {
+                    "description": (
+                        "בוט התרעות צבע אדום בזמן אמת\n"
+                        "מבוסס על נתוני פיקוד העורף - Red Alert Monitor v5\n"
+                        "נבנה על ידי הראלי דודאי"
+                    )
+                })
+            except Exception as e:
+                errors.append(f"תיאור: {e}")
 
-            # ── פקודות ──────────────────────────────────────────
-            api("setMyCommands", {
-                "commands": [
-                    {"command": "start",   "description": "🟢 התחל / הצג מידע"},
-                    {"command": "status",  "description": "📊 סטטוס מערכת"},
-                    {"command": "help",    "description": "❓ עזרה ופקודות"},
-                    {"command": "mute",    "description": "🔕 השתק התרעות ל-30 דקות"},
-                    {"command": "unmute",  "description": "🔔 בטל השתקה"},
-                    {"command": "test",    "description": "📨 שלח הודעת בדיקה"},
-                ]
-            })
+            # ── פקודות ─────────────────────────────────────
+            try:
+                api("setMyCommands", {
+                    "commands": [
+                        {"command": "start",   "description": "התחל / הצג מידע"},
+                        {"command": "status",  "description": "סטטוס מערכת"},
+                        {"command": "help",    "description": "עזרה ופקודות"},
+                        {"command": "mute",    "description": "השתק התרעות ל-30 דקות"},
+                        {"command": "unmute",  "description": "בטל השתקה"},
+                        {"command": "test",    "description": "שלח הודעת בדיקה"},
+                    ]
+                })
+            except Exception as e:
+                errors.append(f"פקודות: {e}")
 
-            self._status.setText("✅  הבוט הוגדר בהצלחה! שם + תיאור + פקודות עודכנו.")
-            self._status.setStyleSheet("color:#88FF88;font-size:11px;")
+            if errors:
+                msg = "הוגדר חלקית:\n" + "\n".join(f"  ⚠ {e}" for e in errors)
+                self._setup_lbl.setText(f"⚠  {msg}")
+                self._setup_lbl.setStyleSheet("color:#FFAA44;")
+                QMessageBox.warning(self, "הגדרה חלקית", msg)
+            else:
+                self._setup_lbl.setText("✅  הבוט הוגדר בהצלחה!")
+                self._setup_lbl.setStyleSheet("color:#88FF88;")
+                QMessageBox.information(self, "הצלחה ✅",
+                    "הבוט הוגדר בהצלחה!\n\n"
+                    "✔ שם: Red Alert Monitor\n"
+                    "✔ תיאור קצר ומלא עודכנו\n"
+                    "✔ 6 פקודות הוגדרו\n\n"
+                    "הפקודות יופיעו בטלגרם תוך מספר שניות.")
+
         except Exception as e:
-            self._status.setText(f"❌  שגיאה: {e}")
-            self._status.setStyleSheet("color:#FF6666;font-size:11px;")
+            self._setup_lbl.setText(f"❌  שגיאה: {e}")
+            self._setup_lbl.setStyleSheet("color:#FF6666;")
+            QMessageBox.critical(self, "שגיאה", f"לא ניתן להתחבר לטלגרם:\n\n{e}")
 
     def _save_values(self):
         self.config.set("telegram_enabled", self._enabled.isChecked())
@@ -2438,6 +2478,7 @@ class TelegramDialog(QDialog):
 # ════════════════════════════════════════════════════════════════
 class SettingsDialog(QDialog):
     request_test           =pyqtSignal()
+    request_full_test      =pyqtSignal()
     request_google_login   =pyqtSignal()
     request_google_logout  =pyqtSignal()
     request_sound_dialog   =pyqtSignal()
@@ -2570,6 +2611,15 @@ class SettingsDialog(QDialog):
         tb=QPushButton("🔔  שלח התרעת בדיקה")
         tb.setStyleSheet("QPushButton{background:#333;color:white;border:none;border-radius:6px;padding:9px 20px;font-size:12px;}QPushButton:hover{background:#444;}")
         tb.clicked.connect(self._test); v.addWidget(tb)
+        ftb=QPushButton("🧪  בדיקה מקיפה  (מסכים + טלגרם + דיווח)")
+        ftb.setStyleSheet(
+            "QPushButton{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "stop:0 #440044,stop:1 #004400);color:#EEFFEE;"
+            "border:1px solid #AA44AA;border-radius:6px;"
+            "padding:11px 20px;font-size:12px;font-weight:bold;}"
+            "QPushButton:hover{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "stop:0 #660066,stop:1 #006600);}")
+        ftb.clicked.connect(self._full_test); v.addWidget(ftb)
         v.addStretch(); v.addWidget(sep())
         bts=QHBoxLayout()
         cas="QPushButton{background:#333;color:white;border:none;border-radius:6px;padding:9px 20px;font-size:12px;}QPushButton:hover{background:#444;}"
@@ -2577,6 +2627,7 @@ class SettingsDialog(QDialog):
         ca.clicked.connect(self.reject); sv.clicked.connect(self._save)
         bts.addWidget(ca); bts.addWidget(sv); v.addLayout(bts)
     def _test(self): self._save(); self.accept(); self.request_test.emit()
+    def _full_test(self): self._save(); self.accept(); self.request_full_test.emit()
     def _save(self):
         self.config.set("sound",              self._cs.isChecked())
         self.config.set("auto_fullscreen",    self._cf.isChecked())
@@ -3821,11 +3872,37 @@ class RedAlertApp(QApplication):
     def _settings(self):
         d=SettingsDialog(self.config,self.widget)
         d.request_test.connect(self._test)
+        d.request_full_test.connect(self._full_test)
         d.request_google_login.connect(self._google_login)
         d.request_google_logout.connect(self._google_logout)
         d.request_sound_dialog.connect(self._sound_dialog)
         d.request_telegram_dialog.connect(self._telegram_dialog)
         d.exec_()
+
+    def _send_telegram_test(self):
+        """שולח הודעת בדיקה לטלגרם בנפרד — נקרא יחד עם _test()."""
+        if not self.config.get("telegram_enabled", False): return
+        token   = self.config.get("telegram_token", "")
+        chat_id = self.config.get("telegram_chat_id", "")
+        if not token or not chat_id: return
+        def _do():
+            try:
+                import urllib.request, urllib.parse
+                from datetime import datetime
+                msg = (
+                    "🔔  <b>הודעת בדיקה — Red Alert Monitor</b>\n\n"
+                    "🚀  סוג: ירי רקטות וטילים\n"
+                    "🏙  ישובים: תל אביב מרכז | רמת גן | בני ברק\n"
+                    f"🕐  שעה: {datetime.now().strftime('%H:%M:%S')}\n\n"
+                    "✅  החיבור לטלגרם תקין!"
+                )
+                params = urllib.parse.urlencode({
+                    "chat_id": chat_id, "text": msg, "parse_mode": "HTML"
+                })
+                url = f"https://api.telegram.org/bot{token}/sendMessage?{params}"
+                urllib.request.urlopen(url, timeout=6)
+            except Exception: pass
+        threading.Thread(target=_do, daemon=True).start()
 
     def _telegram_dialog(self):
         TelegramDialog(self.config, self.widget).exec_()
@@ -3946,6 +4023,63 @@ class RedAlertApp(QApplication):
         self._on_alert({"id":f"T{int(time.time())}","cat":"1",
                         "title":"ירי רקטות וטילים",
                         "data":["תל אביב - מרכז העיר","רמת גן","בני ברק","חולון","גבעתיים"]})
+        self._send_telegram_test()
+
+    def _full_test(self):
+        """בדיקה מקיפה: מסכים + טלגרם + דיווח תוצאות בחלון."""
+        from PyQt5.QtWidgets import QMessageBox
+        results = []
+
+        # ── 1. אפס keys כדי לאלץ תצוגת מסכים מחדש ──────────────────
+        self._active_alert_key = None
+        self._ack_key          = None
+
+        # ── 2. הפעל מסך מלא + overlay ────────────────────────────────
+        try:
+            self._on_alert({"id": f"FT{int(time.time())}", "cat": "1",
+                            "title": "ירי רקטות וטילים",
+                            "data": ["תל אביב - מרכז העיר", "רמת גן",
+                                     "בני ברק", "חולון", "גבעתיים"]})
+            results.append("✅  מסך מלא + Overlay הוקפצו")
+        except Exception as e:
+            results.append(f"❌  מסכים: {e}")
+
+        # ── 3. שלח לטלגרם ישירות (ללא תלות ב-telegram_enabled) ───────
+        token   = self.config.get("telegram_token",  "")
+        chat_id = self.config.get("telegram_chat_id","")
+
+        if not token:
+            results.append("⚠️  טלגרם: חסר Bot Token — הגדר בהגדרות טלגרם")
+        elif not chat_id:
+            results.append("⚠️  טלגרם: חסר Chat ID — לחץ 'זהה אוטומטית' בהגדרות טלגרם")
+        else:
+            try:
+                import urllib.request, urllib.parse
+                from datetime import datetime
+                msg = (
+                    "🧪  <b>בדיקה מקיפה — Red Alert Monitor v5</b>\n\n"
+                    "🚀  ירי רקטות וטילים\n"
+                    "🏙  תל אביב | רמת גן | בני ברק | חולון | גבעתיים\n"
+                    f"🕐  {datetime.now().strftime('%H:%M:%S')}\n\n"
+                    "✅  כל המערכות תקינות!"
+                )
+                params = urllib.parse.urlencode({
+                    "chat_id": chat_id, "text": msg, "parse_mode": "HTML"
+                })
+                url = f"https://api.telegram.org/bot{token}/sendMessage?{params}"
+                with urllib.request.urlopen(url, timeout=8): pass
+                results.append("✅  טלגרם: הודעה נשלחה בהצלחה!")
+            except Exception as e:
+                results.append(f"❌  טלגרם: {e}")
+
+        # ── 4. הצג תוצאות ─────────────────────────────────────────────
+        all_ok = all(r.startswith("✅") for r in results)
+        icon   = QMessageBox.Information if all_ok else QMessageBox.Warning
+        dlg    = QMessageBox(icon,
+                             "תוצאות בדיקה מקיפה ✅" if all_ok else "תוצאות בדיקה מקיפה ⚠️",
+                             "\n".join(results))
+        dlg.setLayoutDirection(Qt.RightToLeft)
+        dlg.exec_()
 
     def _exit(self):
         self.worker.stop(); self._stop_loc_worker()
