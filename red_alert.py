@@ -3279,8 +3279,12 @@ class AlertOverlay(QWidget):
 #  FALL RESULTS  — תוצאות נפילה
 # ════════════════════════════════════════════════════════════════
 class FallResultsWorker(QThread):
-    """מחכה delay_secs לאחר ההתרעה, ואז מאחזר כותרות חדשות ממקורות RSS."""
-    results_ready = pyqtSignal(list)   # list of {"title","desc","link","ts"}
+    """מאחזר חדשות מ-RSS בצורת polling — מוסיף ידיעות חדשות ברגע שמופיעות."""
+    results_ready = pyqtSignal(list)   # list of {"title","desc","link","ts"} — רק פריטים חדשים
+
+    _INITIAL_WAIT = 60    # המתן דקה לפני הבדיקה הראשונה
+    _POLL_INTERVAL = 30   # בדוק כל 30 שניות
+    _MAX_DURATION  = 600  # עצור לאחר 10 דקות
 
     # מילות מפתח לתוצאות ירי/ירוט/נפילה — חייב להופיע יחד עם שם ישוב
     _KEYWORDS = ["נפילה","נפל","מכה","פגיעה","פגע","התפוצץ","נחת",
@@ -3293,38 +3297,62 @@ class FallResultsWorker(QThread):
         "https://www.mako.co.il/AjaxPage?jspName=rssFeedGet.jsp&catId=1",  # mako חדשות
     ]
 
-    def __init__(self, cities, alert_ts, delay_secs=120):
+    def __init__(self, cities, alert_ts):
         super().__init__()
-        self.cities       = [c.strip() for c in cities]
-        self.alert_ts     = alert_ts
-        self.delay_secs   = delay_secs
+        self.cities    = [c.strip() for c in cities]
+        self.alert_ts  = alert_ts
+        self._stop     = False
         self.setObjectName("FallResultsWorker")
 
+    def stop(self):
+        self._stop = True
+
     def run(self):
-        import time as _t; _t.sleep(self.delay_secs)
-        items = []
-        for url in self._RSS_FEEDS:
-            try: items.extend(self._fetch_rss(url))
-            except Exception: pass
-        # deduplicate by title prefix
-        seen, filtered = set(), []
-        for item in items:
-            key = item.get("title","")[:50]
-            if key in seen: continue
-            seen.add(key)
-            # סינון לפי זמן — רק ידיעות שפורסמו אחרי ההתרעה (או עד 10 דקות לפניה)
-            pub_dt = item.get("_pub_dt")
-            if pub_dt is not None:
-                delta = (pub_dt - self.alert_ts).total_seconds()
-                if delta < -600:   # פורסם יותר מ-10 דקות לפני ההתרעה — דלג
-                    continue
-            text = (item.get("title","") + " " + item.get("desc",""))
-            city_hit = any(c in text for c in self.cities)
-            kw_hit   = any(kw in text for kw in self._KEYWORDS)
-            # דרוש גם שם ישוב וגם מילת מפתח — מניעת ידיעות לא קשורות
-            if city_hit and kw_hit:
-                filtered.append(item)
-        self.results_ready.emit(filtered[:10])
+        import time as _t
+        seen       = set()   # כותרות שכבר דיווחנו עליהן
+        found_any  = False
+        start      = _t.time()
+
+        # המתן ראשונית לפני בדיקה ראשונה
+        _t.sleep(self._INITIAL_WAIT)
+
+        while not self._stop and (_t.time() - start) < self._MAX_DURATION:
+            raw = []
+            for url in self._RSS_FEEDS:
+                try: raw.extend(self._fetch_rss(url))
+                except Exception: pass
+
+            new_items = []
+            for item in raw:
+                key = item.get("title","")[:50]
+                if key in seen: continue
+                seen.add(key)
+
+                # סינון לפי זמן פרסום
+                pub_dt = item.get("_pub_dt")
+                if pub_dt is not None:
+                    delta = (pub_dt - self.alert_ts).total_seconds()
+                    if delta < -600: continue   # פורסם יותר מ-10 דקות לפני ההתרעה
+                    if delta > self._MAX_DURATION: continue  # עתידי מדי
+
+                # סינון לפי הקשר: ישוב + מילת מפתח
+                text = item.get("title","") + " " + item.get("desc","")
+                if any(c in text for c in self.cities) and any(kw in text for kw in self._KEYWORDS):
+                    new_items.append(item)
+
+            if new_items:
+                found_any = True
+                self.results_ready.emit(new_items[:5])
+
+            # המתן עד לבדיקה הבאה
+            elapsed   = _t.time() - start
+            remaining = self._MAX_DURATION - elapsed
+            if remaining <= 0: break
+            _t.sleep(min(self._POLL_INTERVAL, remaining))
+
+        # בסיום — אם לא נמצא כלום, הודע פעם אחרונה
+        if not found_any and not self._stop:
+            self.results_ready.emit([])
 
     @staticmethod
     def _fetch_rss(url):
@@ -3388,31 +3416,17 @@ class FallResultsWindow(QWidget):
 
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         cont = QWidget(); cl2 = QVBoxLayout(cont); cl2.setSpacing(10); cl2.setContentsMargins(0,4,0,4)
+        self._scroll_layout = cl2
+        self._no_results_lbl = None
 
         if not results:
-            nl = QLabel("⏳  לא נמצאו עדכונים רלוונטיים כרגע")
+            nl = QLabel("⏳  ממשיך לחפש חדשות רלוונטיות...")
             nl.setAlignment(Qt.AlignCenter)
             nl.setStyleSheet("color:rgba(255,255,255,0.45);font-size:12px;padding:24px;")
             cl2.addWidget(nl)
+            self._no_results_lbl = nl
         else:
-            for item in results:
-                card = QWidget()
-                card.setStyleSheet("QWidget{background:#1a1a30;border-radius:9px;}")
-                kl = QVBoxLayout(card); kl.setContentsMargins(14,10,14,10); kl.setSpacing(4)
-                tl = QLabel(item.get("title",""))
-                tl.setFont(QFont("Arial",11,QFont.Bold)); tl.setWordWrap(True)
-                tl.setStyleSheet("color:white;"); tl.setLayoutDirection(Qt.RightToLeft)
-                kl.addWidget(tl)
-                if item.get("desc"):
-                    dl = QLabel(item["desc"][:180])
-                    dl.setFont(QFont("Arial",10)); dl.setWordWrap(True)
-                    dl.setStyleSheet("color:rgba(255,255,255,0.65);")
-                    dl.setLayoutDirection(Qt.RightToLeft); kl.addWidget(dl)
-                if item.get("ts"):
-                    sl = QLabel(f"🕐  {item['ts']}")
-                    sl.setFont(QFont("Arial",9)); sl.setStyleSheet("color:rgba(255,255,255,0.38);")
-                    kl.addWidget(sl)
-                cl2.addWidget(card)
+            self._add_cards(results)
         cl2.addStretch()
         scroll.setWidget(cont); v.addWidget(scroll, 1)
         v.addWidget(sep())
@@ -3426,6 +3440,48 @@ class FallResultsWindow(QWidget):
         self._auto_close_timer = QTimer(self)
         self._auto_close_timer.setInterval(1000)
         self._auto_close_timer.timeout.connect(self._tick_close)
+        self._auto_close_timer.start()
+
+    def _add_cards(self, items):
+        """מוסיף כרטיסיות ידיעות ל-layout הפנימי (ללא stretch)."""
+        for item in items:
+            card = QWidget()
+            card.setStyleSheet("QWidget{background:#1a1a30;border-radius:9px;}")
+            kl = QVBoxLayout(card); kl.setContentsMargins(14,10,14,10); kl.setSpacing(4)
+            tl = QLabel(item.get("title",""))
+            tl.setFont(QFont("Arial",11,QFont.Bold)); tl.setWordWrap(True)
+            tl.setStyleSheet("color:white;"); tl.setLayoutDirection(Qt.RightToLeft)
+            kl.addWidget(tl)
+            if item.get("desc"):
+                dl = QLabel(item["desc"][:180])
+                dl.setFont(QFont("Arial",10)); dl.setWordWrap(True)
+                dl.setStyleSheet("color:rgba(255,255,255,0.65);")
+                dl.setLayoutDirection(Qt.RightToLeft); kl.addWidget(dl)
+            if item.get("ts"):
+                sl = QLabel(f"🕐  {item['ts']}")
+                sl.setFont(QFont("Arial",9)); sl.setStyleSheet("color:rgba(255,255,255,0.38);")
+                kl.addWidget(sl)
+            if item.get("link"):
+                ll = QLabel(f"🔗  <a href='{item['link']}' style='color:#58a6ff;'>{item['link'][:70]}</a>")
+                ll.setOpenExternalLinks(True); ll.setWordWrap(True)
+                ll.setFont(QFont("Arial",9)); kl.addWidget(ll)
+            self._scroll_layout.addWidget(card)
+
+    def add_items(self, items):
+        """מוסיף ידיעות חדשות לחלון הפתוח ומאפס את הטיימר."""
+        if self._no_results_lbl is not None:
+            self._no_results_lbl.setParent(None)
+            self._no_results_lbl = None
+        # הסר stretch אחרון לפני הוספת פריטים
+        n = self._scroll_layout.count()
+        if n > 0:
+            last = self._scroll_layout.itemAt(n - 1)
+            if last and last.spacerItem():
+                self._scroll_layout.removeItem(last)
+        self._add_cards(items)
+        self._scroll_layout.addStretch()
+        # אפס את הטיימר סגירה אוטומטית
+        self._close_countdown = 15
         self._auto_close_timer.start()
 
     def _tick_close(self):
@@ -3651,7 +3707,10 @@ class RedAlertApp(QApplication):
                 threading.Thread(target=self._fire_webhook,  args=(a,), daemon=True).start()
             # ── Fall results worker — rockets/aircraft only ────────────────────
             if not _is_same_alert and a.cat in ("1","2","13"):
-                fw = FallResultsWorker(a.cities, a.ts, delay_secs=120)
+                # עצור workers ישנים לפני הפעלת חדש
+                for old_fw in list(self._fall_workers):
+                    old_fw.stop()
+                fw = FallResultsWorker(a.cities, a.ts)
                 fw.results_ready.connect(
                     lambda res, _a=a: self._show_fall_results(res, _a))
                 fw.finished.connect(lambda: self._fall_workers.remove(fw)
@@ -3849,15 +3908,34 @@ class RedAlertApp(QApplication):
             webbrowser.open(GMAP_SHARE_URL)
 
     def _show_fall_results(self, results, alert):
-        """מופעל ב-main thread כשה-FallResultsWorker מסיים — מציג חלון ותזכורת."""
-        self._tray.showMessage(
-            "💥  תוצאות נפילה",
-            f"נמצאו {len(results)} עדכוני חדשות רלוונטיים" if results
-            else "לא נמצאו עדכוני חדשות — בדוק בערוצי החדשות",
-            QSystemTrayIcon.Warning if results else QSystemTrayIcon.Information, 8000)
-        win = FallResultsWindow(results, alert.cities, alert.title)
-        win.show()
-        self._fall_result_win = win   # keep reference
+        """מופעל ב-main thread בכל פעם שה-FallResultsWorker מוצא ידיעות חדשות."""
+        if results:
+            # שלח לטלגרם מיד
+            threading.Thread(target=self._send_telegram_fall_results,
+                             args=(results, alert), daemon=True).start()
+            # עדכן חלון קיים או פתח חדש
+            win = getattr(self, "_fall_result_win", None)
+            if win is not None and win.isVisible():
+                win.add_items(results)
+            else:
+                self._tray.showMessage(
+                    "📰  עדכון חדשות",
+                    f"נמצאו {len(results)} ידיעות רלוונטיות",
+                    QSystemTrayIcon.Warning, 8000)
+                win = FallResultsWindow(results, alert.cities, alert.title)
+                win.show()
+                self._fall_result_win = win
+        else:
+            # timeout — לא נמצא כלום לאחר 10 דקות
+            self._tray.showMessage(
+                "💥  תוצאות נפילה",
+                "לא נמצאו עדכוני חדשות — בדוק בערוצי החדשות",
+                QSystemTrayIcon.Information, 8000)
+            win = getattr(self, "_fall_result_win", None)
+            if win is None or not win.isVisible():
+                win = FallResultsWindow([], alert.cities, alert.title)
+                win.show()
+                self._fall_result_win = win
 
     def _on_snooze(self, minutes: int):
         if minutes == 0:
@@ -3920,6 +3998,39 @@ class RedAlertApp(QApplication):
                    f"🏙  {cities_str}\n"
                    f"🕐  {alert.ts.strftime('%H:%M:%S')}")
             params = urllib.parse.urlencode({"chat_id": chat_id, "text": msg, "parse_mode": "HTML"})
+            url = f"https://api.telegram.org/bot{token}/sendMessage?{params}"
+            urllib.request.urlopen(url, timeout=6)
+        except Exception: pass
+
+    def _send_telegram_fall_results(self, results, alert):
+        """שולח לטלגרם עדכון חדשות לאחר ההתרעה (מופעל מ-_show_fall_results)."""
+        if not self.config.get("telegram_enabled", False): return
+        token   = self.config.get("telegram_token", "")
+        chat_id = self.config.get("telegram_chat_id", "")
+        if not token or not chat_id: return
+        try:
+            import urllib.request, urllib.parse
+            cities_str = "  |  ".join(alert.cities[:6])
+            if results:
+                lines = [f"📰  <b>עדכון חדשות — {alert.title}</b>",
+                         f"🏙  {cities_str}",
+                         f"🕐  {alert.ts.strftime('%H:%M:%S')}",
+                         ""]
+                for item in results[:5]:
+                    title = item.get("title", "")
+                    link  = item.get("link", "")
+                    lines.append(f"• <b>{title}</b>")
+                    if link:
+                        lines.append(f"  🔗 {link}")
+                msg = "\n".join(lines)
+            else:
+                msg = (f"📰  <b>עדכון חדשות — {alert.title}</b>\n"
+                       f"🏙  {cities_str}\n"
+                       f"🕐  {alert.ts.strftime('%H:%M:%S')}\n\n"
+                       f"⏳  לא נמצאו עדכוני חדשות רלוונטיים")
+            params = urllib.parse.urlencode({"chat_id": chat_id, "text": msg,
+                                             "parse_mode": "HTML",
+                                             "disable_web_page_preview": "true"})
             url = f"https://api.telegram.org/bot{token}/sendMessage?{params}"
             urllib.request.urlopen(url, timeout=6)
         except Exception: pass
