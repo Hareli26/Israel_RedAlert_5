@@ -1,6 +1,6 @@
 @echo off
 :: ================================================================
-::  Red Alert Monitor v4.1  —  install.bat
+::  Red Alert Monitor v5.1  —  install.bat
 ::  מתקין את התוכנה ל-C:\RedAlertIDF ומגדיר הפעלה עם Windows
 :: ================================================================
 set INSTALL_DIR=C:\RedAlertIDF
@@ -9,7 +9,7 @@ title התקנת Red Alert Monitor → %INSTALL_DIR%
 
 echo.
 echo  =============================================
-echo   Red Alert Monitor v4.1  —  התקנה
+echo   Red Alert Monitor v5.1  —  התקנה
 echo   יעד: %INSTALL_DIR%
 echo  =============================================
 echo.
@@ -23,22 +23,26 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: ── צור תיקיית יעד ────────────────────────────────────────────
-echo [1/4] יוצר תיקייה %INSTALL_DIR% ...
-if not exist "%INSTALL_DIR%" (
-    mkdir "%INSTALL_DIR%"
-    echo   נוצרה: %INSTALL_DIR%
-) else (
-    echo   קיימת: %INSTALL_DIR%
+:: ── סגור תהליך פועל ───────────────────────────────────────────
+echo [0/4] סוגר תהליך פועל (אם קיים)...
+taskkill /f /im RedAlertMonitor.exe /t >nul 2>&1
+timeout /t 2 /nobreak >nul
+
+:: ── מחק התקנה ישנה ────────────────────────────────────────────
+echo [1/4] מוחק התקנה ישנה ומתקין מחדש...
+if exist "%INSTALL_DIR%" (
+    rmdir /s /q "%INSTALL_DIR%"
+    echo   נמחק: %INSTALL_DIR%
 )
+mkdir "%INSTALL_DIR%"
 
 :: ── העתק קבצים ────────────────────────────────────────────────
 echo [2/4] מעתיק קבצים...
 
-:: EXE (אם קיים)
-if exist "%~dp0RedAlertMonitor.exe" (
-    copy /Y "%~dp0RedAlertMonitor.exe" "%INSTALL_DIR%\RedAlertMonitor.exe" >nul
-    echo   OK: RedAlertMonitor.exe
+:: תיקיית EXE שנבנתה (--onedir) — מכילה EXE + כל DLL של WebEngine
+if exist "%~dp0dist\RedAlertMonitor\RedAlertMonitor.exe" (
+    xcopy /E /Y /Q "%~dp0dist\RedAlertMonitor\*" "%INSTALL_DIR%\" >nul
+    echo   OK: תיקיית dist\RedAlertMonitor (כולל WebEngine DLLs)
     set RUN_CMD="%INSTALL_DIR%\RedAlertMonitor.exe"
     set RUN_ARGS=
 ) else if exist "%INSTALL_DIR%\RedAlertMonitor.exe" (
@@ -70,7 +74,7 @@ if exist "%~dp0requirements.txt" (
 )
 
 :: ── Scheduled Task (עם הרשאות מנהל) ──────────────────────────
-echo [3/4] מגדיר Scheduled Task ...
+echo [3/4] מגדיר Scheduled Task (הפעלה עם Windows)...
 
 :: מחיקת ישן
 schtasks /delete /f /tn "%TASK_NAME%" >nul 2>&1

@@ -361,6 +361,8 @@ build_exe.bat
 
 | שלב | פעולה |
 |-----|--------|
+| 0 | סגירת `RedAlertMonitor.exe` אם פועל (`taskkill`) |
+| 0 | מחיקת `C:\RedAlertIDF` הישנה לחלוטין |
 | 1 | התקנת PyInstaller ותלויות |
 | 2 | בנייה כתיקייה (`--onedir --windowed`) עם כל DLL של WebEngine |
 | 3 | העתקת כל התיקייה ל-`C:\RedAlertIDF\` |

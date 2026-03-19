@@ -27,6 +27,18 @@ exit /b 1
 echo Python: %PYTHON_CMD%
 echo.
 
+REM Close running instance
+echo [0/5] Closing running instance (if any)...
+taskkill /f /im RedAlertMonitor.exe /t >nul 2>&1
+timeout /t 2 /nobreak >nul
+
+REM Delete old installation
+echo [0/5] Deleting old installation from %INSTALL_DIR% ...
+if exist "%INSTALL_DIR%" (
+    rmdir /s /q "%INSTALL_DIR%"
+    echo   Deleted: %INSTALL_DIR%
+)
+
 REM Install build tools
 echo [1/5] Installing PyInstaller and dependencies...
 %PYTHON_CMD% -m pip install --upgrade pyinstaller PyQt5 PyQtWebEngine requests
