@@ -3307,11 +3307,34 @@ class FallResultsWorker(QThread):
     def stop(self):
         self._stop = True
 
+    @staticmethod
+    def _norm(s):
+        """נרמול טקסט להשוואה — מחליף מקף/גרש/רווח לצורך התאמה גמישה."""
+        return s.replace("-", " ").replace("–", " ").replace("'", "'")
+
+    def _city_in_text(self, text):
+        """בודק אם אחד מהישובים מופיע בטקסט — עם נרמול מקף/רווח."""
+        norm_text = self._norm(text)
+        return any(self._norm(c) in norm_text for c in self.cities)
+
+    def _log(self, msg):
+        """כותב לוג לקובץ debug לצורך אבחון."""
+        import os, datetime
+        try:
+            log_path = os.path.join(os.environ.get("APPDATA","~"), "RedAlert", "news_debug.log")
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {msg}\n")
+        except Exception:
+            pass
+
     def run(self):
         import time as _t
         seen       = set()   # כותרות שכבר דיווחנו עליהן
         found_any  = False
         start      = _t.time()
+
+        self._log(f"START — cities={self.cities}")
 
         # המתן ראשונית לפני בדיקה ראשונה
         _t.sleep(self._INITIAL_WAIT)
@@ -3319,8 +3342,12 @@ class FallResultsWorker(QThread):
         while not self._stop and (_t.time() - start) < self._MAX_DURATION:
             raw = []
             for url in self._RSS_FEEDS:
-                try: raw.extend(self._fetch_rss(url))
-                except Exception: pass
+                try:
+                    items = self._fetch_rss(url)
+                    raw.extend(items)
+                    self._log(f"RSS OK {url} → {len(items)} items")
+                except Exception as e:
+                    self._log(f"RSS FAIL {url} → {e}")
 
             new_items = []
             for item in raw:
@@ -3335,13 +3362,17 @@ class FallResultsWorker(QThread):
                     if delta < -600: continue   # פורסם יותר מ-10 דקות לפני ההתרעה
                     if delta > self._MAX_DURATION: continue  # עתידי מדי
 
-                # סינון לפי הקשר: ישוב + מילת מפתח
+                # סינון לפי הקשר: ישוב (עם נרמול מקף/רווח) + מילת מפתח
                 text = item.get("title","") + " " + item.get("desc","")
-                if any(c in text for c in self.cities) and any(kw in text for kw in self._KEYWORDS):
+                city_hit = self._city_in_text(text)
+                kw_hit   = any(kw in text for kw in self._KEYWORDS)
+                self._log(f"  item='{key[:40]}' city={city_hit} kw={kw_hit}")
+                if city_hit and kw_hit:
                     new_items.append(item)
 
             if new_items:
                 found_any = True
+                self._log(f"EMIT {len(new_items)} new items")
                 self.results_ready.emit(new_items[:5])
 
             # המתן עד לבדיקה הבאה
@@ -3350,6 +3381,7 @@ class FallResultsWorker(QThread):
             if remaining <= 0: break
             _t.sleep(min(self._POLL_INTERVAL, remaining))
 
+        self._log(f"END — found_any={found_any}")
         # בסיום — אם לא נמצא כלום, הודע פעם אחרונה
         if not found_any and not self._stop:
             self.results_ready.emit([])
@@ -3927,6 +3959,8 @@ class RedAlertApp(QApplication):
                 self._fall_result_win = win
         else:
             # timeout — לא נמצא כלום לאחר 10 דקות
+            threading.Thread(target=self._send_telegram_fall_results,
+                             args=([], alert), daemon=True).start()
             self._tray.showMessage(
                 "💥  תוצאות נפילה",
                 "לא נמצאו עדכוני חדשות — בדוק בערוצי החדשות",
