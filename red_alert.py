@@ -60,7 +60,7 @@ try:
 except ImportError:
     pass
 
-APP_VERSION  = "5.0.0"
+APP_VERSION  = "5.2.0"
 APP_NAME     = "התרעות צבע אדום"
 INSTALL_DIR  = r"C:\RedAlertIDF"          # תיקיית התקנה קבועה
 INSTALL_EXE  = os.path.join(INSTALL_DIR, "RedAlertMonitor.exe")
@@ -3282,9 +3282,9 @@ class FallResultsWorker(QThread):
     """מאחזר חדשות מ-RSS בצורת polling — מוסיף ידיעות חדשות ברגע שמופיעות."""
     results_ready = pyqtSignal(list)   # list of {"title","desc","link","ts"} — רק פריטים חדשים
 
-    _INITIAL_WAIT = 60    # המתן דקה לפני הבדיקה הראשונה
+    _INITIAL_WAIT = 600   # המתן 10 דקות לפני הבדיקה הראשונה
     _POLL_INTERVAL = 30   # בדוק כל 30 שניות
-    _MAX_DURATION  = 600  # עצור לאחר 10 דקות
+    _MAX_DURATION  = 1200 # עצור לאחר 20 דקות (10 המתנה + 10 polling)
 
     # מילות מפתח לתוצאות ירי/ירוט/נפילה — חייב להופיע יחד עם שם ישוב
     _KEYWORDS = ["נפילה","נפל","מכה","פגיעה","פגע","התפוצץ","נחת",
