@@ -1,0 +1,12 @@
+# build outputs — heavy, never commit
+build/
+dist/
+dist2/
+installers/macOS/_dist/
+installers/macOS/*.pkg
+installers/macOS/*.dmg
+
+# OS / python junk
+.DS_Store
+__pycache__/
+*.pyc

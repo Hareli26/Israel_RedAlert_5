@@ -1,0 +1,45 @@
+name: Build Windows EXE
+
+# Triggers are manual (workflow_dispatch) or version tags only —
+# no untrusted event input (issue/PR text) is used anywhere in run: commands.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pyinstaller PyQt5 PyQtWebEngine requests
+
+      - name: Build EXE
+        shell: cmd
+        run: >
+          python -m PyInstaller --noconfirm --onedir --windowed
+          --icon "installers/Windows/RedAlertIDF.ico"
+          --name "RedAlertMonitor"
+          --hidden-import PyQt5.sip
+          --hidden-import PyQt5.QtWebEngineWidgets
+          --hidden-import PyQt5.QtWebEngine
+          --hidden-import PyQt5.QtWebEngineCore
+          --collect-all PyQt5
+          --collect-all PyQtWebEngine
+          red_alert.py
+
+      - name: Zip output
+        shell: pwsh
+        run: Compress-Archive -Path dist/RedAlertMonitor -DestinationPath RedAlertMonitor-Windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RedAlertMonitor-Windows
+          path: RedAlertMonitor-Windows.zip
