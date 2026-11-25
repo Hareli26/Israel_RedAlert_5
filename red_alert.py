@@ -1008,59 +1008,232 @@ class Alert:
         return out
 
 # ════════════════════════════════════════════════════════════════
+#  FEED PARSING  — primary (OREF) + backup source, and message classification
+# ════════════════════════════════════════════════════════════════
+# Backup source, used only while the OREF feed is failing (PRD FR-8).
+# GUESS (not verified from an Israeli IP): returns a JSON list of currently
+# active alerts, e.g. [{"notificationId":"…","time":…,"threat":0,
+# "isDrill":false,"cities":["…"]}] and [] when quiet.
+BACKUP_URL = "https://api.tzevaadom.co.il/notifications"
+BACKUP_HEADERS = {
+    "User-Agent": API_HEADERS["User-Agent"],
+    "Accept":     "application/json",
+}
+# GUESS: tzevaadom "threat" codes → this app's CATEGORIES keys (for icon/colour).
+BACKUP_THREAT_TO_CAT = {0: "1", 1: "4", 2: "5", 3: "3", 4: "6", 5: "2"}
+BACKUP_THREAT_TITLES = {
+    0: "ירי רקטות וטילים", 1: "חומרים מסוכנים", 2: "חדירת מחבלים",
+    3: "רעידת אדמה", 4: "צונאמי", 5: "חדירת כלי טייס עוין",
+}
+
+# Consecutive failed polls of the primary feed before we warn and switch to backup
+# (~6 s at the default 2 s interval). One failure alone is usually a network blip.
+FEED_FAIL_THRESHOLD = 3
+
+# OREF also pushes messages through alerts.json that are NOT alarms.
+# GUESS: cat 10 is the "news flash" channel (early warnings, event-ended, may leave
+# shelter) and cat >= 100 are drills; the title phrases below are matched as well,
+# so a wrong guess on the numbers is still caught by the text.
+NOTICE_CATS = {"10"}
+EARLY_WARNING_PHRASES = ("בדקות הקרובות", "צפויות להתקבל התרעות", "התרעה מקדימה")
+EVENT_ENDED_PHRASES   = ("האירוע הסתיים", "ניתן לצאת מהמרחב המוגן", "הסתיים האירוע")
+DRILL_PHRASES         = ("תרגיל",)
+
+
+class FeedError(Exception):
+    """The feed answered with something that is not a valid alert payload."""
+
+
+def classify_oref(data):
+    """Return 'alert', 'drill', 'early_warning', 'event_ended' or 'notice'."""
+    cat = str(data.get("cat", ""))
+    text = f"{data.get('title','')} {data.get('desc','')}"
+    try: cat_num = int(cat)
+    except ValueError: cat_num = -1
+    if cat_num >= 100 or any(p in text for p in DRILL_PHRASES):
+        return "drill"
+    if any(p in text for p in EVENT_ENDED_PHRASES):
+        return "event_ended"
+    if any(p in text for p in EARLY_WARNING_PHRASES):
+        return "early_warning"
+    if cat in NOTICE_CATS:
+        return "notice"
+    return "alert"
+
+
+def _decode_body(body):
+    """Feed bodies are UTF-8 with a BOM and CRLF (BOM + CRLF only when quiet, as
+    seen from Israel on 2026-11-25). Decode bytes ourselves so a mis-guessed charset
+    can't turn the BOM into mojibake and make a quiet feed look broken."""
+    if isinstance(body, (bytes, bytearray)):
+        if body[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            body = body.decode("utf-16", errors="replace")
+        else:
+            body = body.decode("utf-8-sig", errors="replace")
+    body = (body or "").replace("\ufeff", "").replace("\u00ef\u00bb\u00bf", "")
+    return body.strip()
+
+
+def parse_oref_response(status_code, text):
+    """Primary feed → dict payload, or None when the feed is quiet.
+    Raises FeedError for anything that means we did NOT get real data
+    (blocked, server error, HTML error page, garbage), so it can't pass as 'quiet'."""
+    if status_code != 200:
+        if status_code in (401, 403):
+            raise FeedError(f"הגישה לפיקוד העורף נחסמה (HTTP {status_code})")
+        raise FeedError(f"שגיאת שרת פיקוד העורף (HTTP {status_code})")
+    text = _decode_body(text)
+    if not text or text in ("{}", "null", "[]"):
+        return None
+    if text.startswith("<"):
+        raise FeedError("פיקוד העורף החזיר דף שגיאה במקום נתונים")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise FeedError("תשובה לא תקינה מפיקוד העורף")
+    if not isinstance(data, dict):
+        raise FeedError("תשובה לא צפויה מפיקוד העורף")
+    if "id" not in data:
+        return None
+    return data
+
+
+def parse_backup_response(status_code, text):
+    """Backup feed → OREF-shaped dict, or None when quiet. Raises FeedError."""
+    if status_code != 200:
+        raise FeedError(f"מקור הגיבוי לא זמין (HTTP {status_code})")
+    text = _decode_body(text)
+    if not text:
+        return None
+    try:
+        items = json.loads(text)
+    except ValueError:
+        raise FeedError("תשובה לא תקינה ממקור הגיבוי")
+    if not isinstance(items, list):
+        raise FeedError("תשובה לא צפויה ממקור הגיבוי")
+    live = [n for n in items if isinstance(n, dict) and not n.get("isDrill")]
+    if not live:
+        return None
+    # Merge all live notifications into one OREF-shaped payload (newest threat wins
+    # for icon/colour). GUESS: good enough for a fallback; OREF does the same.
+    live.sort(key=lambda n: n.get("time", 0), reverse=True)
+    threat = live[0].get("threat", 0)
+    cities = []
+    for n in live:
+        for c in n.get("cities", []) or []:
+            if c not in cities: cities.append(c)
+    ids = sorted(str(n.get("notificationId", n.get("time", ""))) for n in live)
+    return {
+        "id":    "backup-" + "-".join(ids),
+        "cat":   BACKUP_THREAT_TO_CAT.get(threat, "1"),
+        "title": BACKUP_THREAT_TITLES.get(threat, "התרעה"),
+        "data":  cities,
+        "_source": "backup",
+    }
+
+
+def describe_request_error(exc):
+    if isinstance(exc, FeedError): return str(exc)
+    if isinstance(exc, requests.exceptions.Timeout): return "פיקוד העורף לא מגיב (timeout)"
+    if isinstance(exc, requests.exceptions.ConnectionError): return "אין חיבור לאינטרנט"
+    return f"שגיאה בקריאת הפיד ({type(exc).__name__})"
+
+
+# ════════════════════════════════════════════════════════════════
 #  ALERT WORKER  (now supports dynamic friend-city filter)
 # ════════════════════════════════════════════════════════════════
 class AlertWorker(QThread):
     new_alert=pyqtSignal(dict); alert_cleared=pyqtSignal()
     conn_error=pyqtSignal(str); conn_ok=pyqtSignal()
+    # level: "ok" | "backup" (primary down, backup working) | "down" (no data at all)
+    feed_status=pyqtSignal(str,str)
+    # non-alarm messages for the user's area: kind ("early_warning"/"event_ended"/"notice"), payload
+    new_notice=pyqtSignal(str,dict)
     def __init__(self,config):
         super().__init__(); self.config=config; self._running=True
-        self._last_id=None; self._had_err=False; self._clear_count=0
+        self._last_id=None; self._clear_count=0; self._last_notice_id=None
+        self._fail_count=0; self._state="ok"
         self._friend_cities=set(); self._temp_cities=set(); self._lock=threading.Lock()
     def update_friend_cities(self,cities):
         with self._lock: self._friend_cities=set(c for c in cities if c)
     def update_temp_cities(self,cities):
         with self._lock: self._temp_cities=set(c for c in cities if c)
+
+    def _set_state(self, state, msg=""):
+        if state == self._state: return
+        self._state = state
+        self.feed_status.emit(state, msg)
+        if state == "ok": self.conn_ok.emit()
+        else: self.conn_error.emit(msg)
+
+    def _watched(self):
+        locs=self.config.get("locations",[])
+        with self._lock: friend_locs=self._friend_cities; temp_locs=self._temp_cities
+        return set(locs)|friend_locs|temp_locs
+
+    def _quiet_tick(self):
+        self._clear_count += 1
+        if self._clear_count >= 2 and self._last_id is not None:
+            self._last_id=None; self._clear_count=0; self.alert_cleared.emit()
+
+    def _process(self, data):
+        """Handle one successful poll (from either source). data=None means quiet."""
+        if not data:
+            self._quiet_tick(); return
+        kind = classify_oref(data)
+        if kind != "alert":
+            # Drills and notices never sound the alarm or count as an active alert.
+            if kind != "drill":
+                all_locs=self._watched(); cities=data.get("data",[])
+                matched=[c for c in cities if c in all_locs] if all_locs else list(cities)
+                nid=str(data.get("id"))
+                if matched and nid != self._last_notice_id:
+                    self._last_notice_id=nid
+                    fd=dict(data); fd["data"]=matched; self.new_notice.emit(kind, fd)
+            self._quiet_tick(); return
+        aid=str(data["id"])
+        if aid==self._last_id:
+            self._clear_count=0; return
+        self._clear_count=0; self._last_id=aid
+        all_locs=self._watched(); cities=data.get("data",[])
+        if not all_locs:
+            self.new_alert.emit(data)
+        else:
+            matched=[c for c in cities if c in all_locs]
+            if matched:
+                fd=dict(data); fd["data"]=matched; self.new_alert.emit(fd)
+
     def run(self):
         sess=requests.Session(); sess.headers.update(API_HEADERS)
+        bsess=requests.Session(); bsess.headers.update(BACKUP_HEADERS)
         while self._running:
             try:
-                r=sess.get(OREF_URL,timeout=4); text=r.text.strip().lstrip("\ufeff")
-                if self._had_err: self._had_err=False; self.conn_ok.emit()
-                if not text or len(text)<5 or text in ("{}","null",""):
-                    self._clear_count += 1
-                    if self._clear_count >= 2 and self._last_id is not None:
-                        self._last_id=None; self._clear_count=0; self.alert_cleared.emit()
+                data=None; primary_err=None
+                try:
+                    r=sess.get(OREF_URL,timeout=4)
+                    data=parse_oref_response(r.status_code, r.content)
+                except Exception as e:
+                    primary_err=e
+                if primary_err is None:
+                    self._fail_count=0
+                    self._set_state("ok")
+                    self._process(data)
                 else:
-                    self._clear_count = 0
-                    try: data=json.loads(text)
-                    except Exception: data={}
-                    if data and "id" in data:
-                        aid=str(data["id"])
-                        # Filter out cat=101 "בדיקה" — OREF system test alerts
-                        if str(data.get("cat","")) == "101":
-                            self._clear_count += 1
-                            if self._clear_count >= 2 and self._last_id is not None:
-                                self._last_id=None; self._clear_count=0; self.alert_cleared.emit()
-                        elif aid!=self._last_id:
-                            self._clear_count=0; self._last_id=aid
-                            locs=self.config.get("locations",[])
-                            with self._lock: friend_locs=self._friend_cities; temp_locs=self._temp_cities
-                            all_locs=list(set(locs)|friend_locs|temp_locs)
-                            cities=data.get("data",[])
-                            if not all_locs:
-                                self.new_alert.emit(data)
-                            else:
-                                matched=[c for c in cities if c in all_locs]
-                                if matched:
-                                    fd=dict(data); fd["data"]=matched; self.new_alert.emit(fd)
-                    else:
-                        self._clear_count += 1
-                        if self._clear_count >= 2 and self._last_id is not None:
-                            self._last_id=None; self._clear_count=0; self.alert_cleared.emit()
-            except requests.exceptions.ConnectionError:
-                if not self._had_err: self._had_err=True; self.conn_error.emit("אין חיבור לאינטרנט")
-            except Exception: pass
+                    self._fail_count += 1
+                    # A single failure is not "quiet": skip this tick without
+                    # counting it toward the all-clear.
+                    if self._fail_count >= FEED_FAIL_THRESHOLD:
+                        why=describe_request_error(primary_err)
+                        try:
+                            rb=bsess.get(BACKUP_URL,timeout=4)
+                            bdata=parse_backup_response(rb.status_code, rb.content)
+                            self._set_state("backup", f"{why} — פועל ממקור גיבוי")
+                            self._process(bdata)
+                        except Exception as be:
+                            self._set_state("down",
+                                f"אין נתוני התרעות! {why}; גם מקור הגיבוי נכשל")
+            except Exception:
+                pass
             time.sleep(self.config.get("poll_interval", 2))
     def stop(self): self._running=False; self.quit(); self.wait(2000)
 
@@ -1758,8 +1931,15 @@ class FloatingWidget(QWidget):
         self._il=QVBoxLayout(self._iw); self._il.setContentsMargins(0,0,0,0)
         self._il.setSpacing(3); self._il.setAlignment(Qt.AlignTop); self._scroll.setWidget(self._iw)
         self._lconn=QLabel(""); self._lconn.setAlignment(Qt.AlignCenter)
-        self._lconn.setFont(QFont("Arial",7)); self._lconn.setFixedHeight(13)
-        self._lconn.setStyleSheet("color:rgba(255,220,0,0.75);")
+        self._lconn.setLayoutDirection(Qt.RightToLeft); self._lconn.setWordWrap(True)
+        self._lconn.hide()
+        # הודעות שאינן אזעקה (התרעה מקדימה / האירוע הסתיים) — שורה נפרדת, בלי צליל
+        self._lnotice=QLabel(""); self._lnotice.setAlignment(Qt.AlignCenter)
+        self._lnotice.setLayoutDirection(Qt.RightToLeft); self._lnotice.setWordWrap(True)
+        self._lnotice.setFont(QFont("Arial",9,QFont.Bold)); self._lnotice.hide()
+        self._notice_timer=QTimer(self); self._notice_timer.setSingleShot(True)
+        self._notice_timer.timeout.connect(self._lnotice.hide)
+        self._feed_level="ok"
         # ── קרדיט ────────────────────────────────────────────────
         self._lcredit=QLabel("נבנה על ידי הראלי דודאי  |  2026  |  v5.3")
         self._lcredit.setAlignment(Qt.AlignCenter)
@@ -1767,7 +1947,8 @@ class FloatingWidget(QWidget):
         self._lcredit.setStyleSheet("color:rgba(255,210,120,0.72);background:transparent;")
         self._grip=QSizeGrip(self); self._grip.setStyleSheet("background:transparent;")
         root.addWidget(hdr); root.addWidget(self._idle)
-        root.addWidget(self._scroll,1); root.addWidget(self._lconn); root.addWidget(self._lcredit)
+        root.addWidget(self._scroll,1); root.addWidget(self._lnotice)
+        root.addWidget(self._lconn); root.addWidget(self._lcredit)
     def _position(self):
         sc=QApplication.desktop().availableGeometry()
         x=self.config.get("widget_x"); y=self.config.get("widget_y")
@@ -1853,8 +2034,48 @@ class FloatingWidget(QWidget):
         lay.addWidget(li); lay.addLayout(col,1); lay.addWidget(tt,0,Qt.AlignTop)
         f.mouseDoubleClickEvent=lambda e: self.sig_fullscreen.emit()
         return f
-    def set_conn_error(self,m): self._lconn.setText(f"⚠ {m}")
-    def set_conn_ok(self):       self._lconn.setText("")
+    def set_conn_error(self,m): self.set_feed_status("down", m)
+    def set_conn_ok(self):       self.set_feed_status("ok", "")
+    def set_feed_status(self, level, msg):
+        """level: ok / backup / down. 'down' must never look like a quiet day."""
+        self._feed_level=level
+        if level=="ok":
+            self._lconn.hide(); self._lconn.setText("")
+            self._idle.setText("אין התרעות פעילות")
+            self._idle.setStyleSheet("color:rgba(255,255,255,0.45);padding:12px 0;")
+            return
+        if level=="backup":
+            self._lconn.setFont(QFont("Arial",8,QFont.Bold))
+            self._lconn.setStyleSheet("color:#1a1200;background:rgba(255,200,0,0.92);"
+                                      "border-radius:5px;padding:3px 6px;")
+            self._lconn.setText(f"⚠ {msg}")
+            self._idle.setText("אין התרעות פעילות (ממקור גיבוי)")
+            self._idle.setStyleSheet("color:rgba(255,220,120,0.85);padding:12px 0;")
+        else:
+            self._lconn.setFont(QFont("Arial",10,QFont.Bold))
+            self._lconn.setStyleSheet("color:white;background:rgba(200,0,0,0.95);"
+                                      "border-radius:5px;padding:5px 6px;")
+            self._lconn.setText(f"⛔ {msg}")
+            self._idle.setText("⛔ הפיד לא זמין — אין לדעת אם יש התרעות כרגע")
+            self._idle.setStyleSheet("color:#FF6060;font-weight:bold;padding:12px 0;")
+            if self._minimized: self._toggle_min()
+        self._lconn.show(); self._grow_to_fit()
+    def _grow_to_fit(self):
+        if self._minimized: return
+        self.layout().activate()
+        h=self.layout().sizeHint().height()
+        if h>self.height(): self.resize(self.width(), h)
+    def show_notice(self, kind, data):
+        cities=data.get("data",[]) or []
+        cs="  |  ".join(cities[:3])+(f"  +{len(cities)-3}" if len(cities)>3 else "")
+        title=data.get("title","") or "הודעת פיקוד העורף"
+        if kind=="event_ended":
+            style="color:#002a10;background:rgba(80,220,120,0.92);"; icon="✅"
+        else:
+            style="color:#1a1200;background:rgba(255,170,0,0.95);"; icon="⚠"
+        self._lnotice.setStyleSheet(style+"border-radius:6px;padding:5px 6px;")
+        self._lnotice.setText(f"{icon} {title}\n{cs}  ·  {datetime.now().strftime('%H:%M')}")
+        self._lnotice.show(); self._notice_timer.start(10*60*1000); self._grow_to_fit()
     def _tick(self): self._pulse=not self._pulse; self._step=(self._step+1)%360; self.update()
     def paintEvent(self,e):
         p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
@@ -4165,8 +4386,8 @@ class RedAlertApp(QApplication):
         self.worker=AlertWorker(self.config)
         self.worker.new_alert.connect(self._on_alert)
         self.worker.alert_cleared.connect(self._on_clear)
-        self.worker.conn_error.connect(self.widget.set_conn_error)
-        self.worker.conn_ok.connect(self.widget.set_conn_ok)
+        self.worker.feed_status.connect(self._on_feed_status)
+        self.worker.new_notice.connect(self._on_notice)
         self.worker.start()
         # ── Fetch full OREF city list in background ─────────────────
         threading.Thread(target=_fetch_oref_cities, daemon=True).start()
@@ -4666,6 +4887,58 @@ class RedAlertApp(QApplication):
                                              "disable_web_page_preview": "true"})
             url = f"https://api.telegram.org/bot{token}/sendMessage?{params}"
             urllib.request.urlopen(url, timeout=6)
+        except Exception: pass
+
+    # ── Feed health & non-alarm notices ───────────────────────
+    def _on_feed_status(self, level, msg):
+        self.widget.set_feed_status(level, msg)
+        if level=="ok":
+            title, body = "פיד ההתרעות חזר לפעול", "החיבור לפיקוד העורף תקין"
+        elif level=="backup":
+            title, body = "פיד פיקוד העורף לא זמין", msg
+        else:
+            title, body = "⛔ אין נתוני התרעות", msg
+        try:
+            self._tray.showMessage(title, body,
+                QSystemTrayIcon.Critical if level=="down" else QSystemTrayIcon.Warning, 15000)
+        except Exception: pass
+        text = f"{'✅' if level=='ok' else '⛔' if level=='down' else '⚠'}  <b>{title}</b>\n{body}"
+        threading.Thread(target=self._send_telegram_text, args=(text,), daemon=True).start()
+        threading.Thread(target=self._post_webhook, args=({
+            "type": "feed_status", "level": level, "message": msg,
+            "ts": datetime.now().isoformat()},), daemon=True).start()
+
+    def _on_notice(self, kind, data):
+        self.widget.show_notice(kind, data)
+        try:
+            self._tray.showMessage(data.get("title","הודעת פיקוד העורף"),
+                "  |  ".join((data.get("data") or [])[:6]), QSystemTrayIcon.Information, 15000)
+        except Exception: pass
+        threading.Thread(target=self._post_webhook, args=({
+            "type": "notice", "kind": kind, "title": data.get("title",""),
+            "cities": data.get("data",[]), "cat": str(data.get("cat","")),
+            "ts": datetime.now().isoformat()},), daemon=True).start()
+
+    def _send_telegram_text(self, msg):
+        if not self.config.get("telegram_enabled", False): return
+        token   = self.config.get("telegram_token", "")
+        chat_id = self.config.get("telegram_chat_id", "")
+        if not token or not chat_id: return
+        try:
+            import urllib.request, urllib.parse
+            params = urllib.parse.urlencode({"chat_id": chat_id, "text": msg, "parse_mode": "HTML"})
+            urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage?{params}", timeout=6)
+        except Exception: pass
+
+    def _post_webhook(self, body):
+        if not self.config.get("webhook_enabled", False): return
+        url = self.config.get("webhook_url", "")
+        if not url: return
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                         headers={"Content-Type":"application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=6)
         except Exception: pass
 
     def _fire_webhook(self, alert):
