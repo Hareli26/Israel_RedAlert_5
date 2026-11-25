@@ -28,6 +28,18 @@ def test_classify(data, kind):
 def test_quiet_responses():
     for t in ["", "﻿", "  \r\n", "{}", "null", "﻿\r\n"]:
         assert ra.parse_oref_response(200, t) is None
+    for b in [b"\xef\xbb\xbf\r\n", b"\r\n", b"", "\ufeff\r\n".encode("utf-16"),
+              "\u00ef\u00bb\u00bf\r\n"]:
+        assert ra.parse_oref_response(200, b) is None, b
+
+def test_alert_response_bytes_with_bom():
+    body = b"\xef\xbb\xbf" + json.dumps({"id": "7", "cat": "1", "title": "ירי רקטות וטילים",
+                                          "data": ["תל אביב"]}, ensure_ascii=False).encode("utf-8")
+    d = ra.parse_oref_response(200, body)
+    assert d["id"] == "7" and d["data"] == ["תל אביב"]
+
+def test_backup_quiet_bytes():
+    assert ra.parse_backup_response(200, b"[]") is None
 
 def test_alert_response():
     body = "﻿" + json.dumps({"id": "1", "cat": "1", "title": "x", "data": ["a"]})
@@ -64,7 +76,9 @@ def test_backup_errors():
 
 # ── worker loop with fake network ─────────────────────────────
 class FakeResp:
-    def __init__(self, code, text): self.status_code, self.text = code, text
+    def __init__(self, code, text):
+        self.status_code, self.text = code, text
+        self.content = text.encode("utf-8")
 
 class Cfg:
     def __init__(self, locs=()): self.d = {"locations": list(locs), "poll_interval": 0}
@@ -93,7 +107,7 @@ def run_worker(primary_seq, backup_seq, locs=()):
     return events
 
 ALERT = FakeResp(200, json.dumps({"id": "A1", "cat": "1", "title": "ירי רקטות וטילים", "data": ["תל אביב"]}))
-QUIET = FakeResp(200, "﻿")
+QUIET = FakeResp(200, "\ufeff\r\n")   # what OREF really sends when quiet
 BLOCK = FakeResp(403, "<html>Access Denied</html>")
 
 def test_geoblock_is_not_quiet_and_warns():

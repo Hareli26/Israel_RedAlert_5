@@ -1061,6 +1061,19 @@ def classify_oref(data):
     return "alert"
 
 
+def _decode_body(body):
+    """Feed bodies are UTF-8 with a BOM and CRLF (BOM + CRLF only when quiet, as
+    seen from Israel on 2026-11-25). Decode bytes ourselves so a mis-guessed charset
+    can't turn the BOM into mojibake and make a quiet feed look broken."""
+    if isinstance(body, (bytes, bytearray)):
+        if body[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            body = body.decode("utf-16", errors="replace")
+        else:
+            body = body.decode("utf-8-sig", errors="replace")
+    body = (body or "").replace("\ufeff", "").replace("\u00ef\u00bb\u00bf", "")
+    return body.strip()
+
+
 def parse_oref_response(status_code, text):
     """Primary feed → dict payload, or None when the feed is quiet.
     Raises FeedError for anything that means we did NOT get real data
@@ -1069,7 +1082,7 @@ def parse_oref_response(status_code, text):
         if status_code in (401, 403):
             raise FeedError(f"הגישה לפיקוד העורף נחסמה (HTTP {status_code})")
         raise FeedError(f"שגיאת שרת פיקוד העורף (HTTP {status_code})")
-    text = (text or "").strip().lstrip("﻿").strip()
+    text = _decode_body(text)
     if not text or text in ("{}", "null", "[]"):
         return None
     if text.startswith("<"):
@@ -1089,7 +1102,7 @@ def parse_backup_response(status_code, text):
     """Backup feed → OREF-shaped dict, or None when quiet. Raises FeedError."""
     if status_code != 200:
         raise FeedError(f"מקור הגיבוי לא זמין (HTTP {status_code})")
-    text = (text or "").strip().lstrip("﻿").strip()
+    text = _decode_body(text)
     if not text:
         return None
     try:
@@ -1198,7 +1211,7 @@ class AlertWorker(QThread):
                 data=None; primary_err=None
                 try:
                     r=sess.get(OREF_URL,timeout=4)
-                    data=parse_oref_response(r.status_code, r.text)
+                    data=parse_oref_response(r.status_code, r.content)
                 except Exception as e:
                     primary_err=e
                 if primary_err is None:
@@ -1213,7 +1226,7 @@ class AlertWorker(QThread):
                         why=describe_request_error(primary_err)
                         try:
                             rb=bsess.get(BACKUP_URL,timeout=4)
-                            bdata=parse_backup_response(rb.status_code, rb.text)
+                            bdata=parse_backup_response(rb.status_code, rb.content)
                             self._set_state("backup", f"{why} — פועל ממקור גיבוי")
                             self._process(bdata)
                         except Exception as be:
